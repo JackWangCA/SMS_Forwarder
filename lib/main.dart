@@ -6,6 +6,7 @@ import 'package:google_sign_in/google_sign_in.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:another_telephony/telephony.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
 import 'login_page.dart';
 import 'messages_page.dart';
@@ -15,19 +16,61 @@ import 'services/db_service.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  // Initialize port and configure the Foreground Service at app start.
+  FlutterForegroundTask.initCommunicationPort();
+  FlutterForegroundTask.init(
+    androidNotificationOptions:  AndroidNotificationOptions(
+      channelId: 'sms_forwarder_fg',
+      channelName: 'SMS Forwarder Service',
+      channelDescription: 'Keeps SMS listening and forwarding active.',
+      onlyAlertOnce: true,
+    ),
+    iosNotificationOptions: const IOSNotificationOptions(
+      showNotification: false,
+      playSound: false,
+    ),
+    foregroundTaskOptions:  ForegroundTaskOptions(
+      eventAction: ForegroundTaskEventAction.repeat(15000), // harmless heartbeat
+      autoRunOnBoot: true,
+      autoRunOnMyPackageReplaced: true,
+      allowWakeLock: true,
+      allowWifiLock: true,
+    ),
+  );
   runApp(const SmsForwarderApp());
 }
 
-/// Background handler for SMS (no foreground service needed).
-/// Must be a top-level or static function and annotated as entry-point.
+/// Top-level callback required by flutter_foreground_task.
+@pragma('vm:entry-point')
+void startCallback() {
+  FlutterForegroundTask.setTaskHandler(SmsKeepAliveTask());
+}
+
+/// Lightweight keep-alive task; we don't do any heavy work here.
+class SmsKeepAliveTask extends TaskHandler {
+  @override
+  Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
+    FlutterForegroundTask.updateService(
+      notificationTitle: 'SMS Forwarder is active',
+      notificationText: 'Listening for incoming SMS…',
+    );
+  }
+
+  @override
+  void onRepeatEvent(DateTime timestamp) {
+    // Optional heartbeat - keep notification fresh.
+    FlutterForegroundTask.updateService(
+      notificationText: 'Listening… ${timestamp.toLocal()}',
+    );
+  }
+
+  @override
+  Future<void> onDestroy(DateTime timestamp, bool isTimeout) async {}
+}
+
+/// Background handler for SMS. Must be top-level and annotated as entry-point.
 @pragma('vm:entry-point')
 void onBackgroundSms(SmsMessage message) {
-  // Keep logs short; some OEMs truncate long prints from bg isolate.
-  // NOTE: You can't touch UI here. Do light work or enqueue to your DB layer
-  // if it is isolate-safe. If not, just log and rely on onNewMessage in FG.
-  // (another_telephony will wake your app and invoke this.)
-  // If you want DB writes here, make sure your DbService can be used safely.
-  // For now, just log:
   // ignore: avoid_print
   print('[BG] SMS from ${message.address} len=${message.body?.length ?? 0}');
 }
@@ -57,6 +100,11 @@ class _SmsForwarderAppState extends State<SmsForwarderApp> {
     super.initState();
     _loadForwardEmail();
 
+    // Receive data from TaskHandler if you ever send it (optional).
+    FlutterForegroundTask.addTaskDataCallback((data) {
+      debugPrint('[FGS->UI] $data');
+    });
+
     _googleSignIn.onCurrentUserChanged.listen((account) async {
       final wasNull = _user == null;
       setState(() => _user = account);
@@ -66,6 +114,41 @@ class _SmsForwarderAppState extends State<SmsForwarderApp> {
     });
 
     _googleSignIn.signInSilently();
+  }
+
+  // ---------- Foreground Service helpers ----------
+  Future<void> _requestFgPermissions() async {
+    final notifPerm = await FlutterForegroundTask.checkNotificationPermission();
+    if (notifPerm != NotificationPermission.granted) {
+      await FlutterForegroundTask.requestNotificationPermission();
+    }
+
+    if (Platform.isAndroid) {
+      if (!await FlutterForegroundTask.isIgnoringBatteryOptimizations) {
+        // Requires android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+        await FlutterForegroundTask.requestIgnoreBatteryOptimization();
+      }
+    }
+  }
+
+  Future<void> _ensureFgServiceStarted() async {
+    if (await FlutterForegroundTask.isRunningService) {
+      await FlutterForegroundTask.updateService(
+        notificationTitle: 'SMS Forwarder is active',
+        notificationText: 'Running in background',
+      );
+      return;
+    }
+
+    await FlutterForegroundTask.startService(
+      serviceId: 100, // any int
+      // Use a messaging-friendly service type; you may also set this in manifest.
+      serviceTypes: const [ForegroundServiceTypes.remoteMessaging],
+      notificationTitle: 'SMS Forwarder is active',
+      notificationText: 'Listening for incoming SMS…',
+      notificationButtons: const [],
+      callback: startCallback,
+    );
   }
 
   // ---------- Post-login initialization ----------
@@ -84,7 +167,6 @@ class _SmsForwarderAppState extends State<SmsForwarderApp> {
     }
 
     await _loadMessagesFromDb();
-    
 
     // Start listening to *real* SMS (RCS/chat won’t trigger this)
     _telephony.listenIncomingSms(
@@ -122,6 +204,10 @@ class _SmsForwarderAppState extends State<SmsForwarderApp> {
       // This runs when the app is backgrounded; keep it very light
       onBackgroundMessage: onBackgroundSms,
     );
+
+    // Foreground Service: request needed perms and start it.
+    await _requestFgPermissions();
+    await _ensureFgServiceStarted();
   }
 
   // ---------- Persistence ----------
@@ -167,7 +253,9 @@ class _SmsForwarderAppState extends State<SmsForwarderApp> {
 
   @override
   void dispose() {
+    // Do NOT stop the foreground service; we want it to keep running.
     _dbService.close();
+    FlutterForegroundTask.removeTaskDataCallback((_) {});
     super.dispose();
   }
 
@@ -234,97 +322,99 @@ class _SmsForwarderAppState extends State<SmsForwarderApp> {
     return MaterialApp(
       title: 'SMS Forwarder',
       theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.teal),
-      home: Scaffold(
-        appBar: AppBar(title: const Text('SMS Forwarder'), centerTitle: true),
-        drawer: Drawer(
-          child: SafeArea(
-            child: ListView(
-              padding: EdgeInsets.zero,
-              children: [
-                if (_user != null)
-                  UserAccountsDrawerHeader(
-                    accountName: Text(_user?.displayName ?? 'Signed-in user'),
-                    accountEmail: Text(_user?.email ?? ''),
-                    currentAccountPicture: CircleAvatar(
-                      child: Text(_initialsFromName(_user?.displayName, _user?.email)),
-                    ),
-                  )
-                else
-                  const DrawerHeader(child: Text('Not signed in')),
+      home: WithForegroundTask(
+        child: Scaffold(
+          appBar: AppBar(title: const Text('SMS Forwarder'), centerTitle: true),
+          drawer: Drawer(
+            child: SafeArea(
+              child: ListView(
+                padding: EdgeInsets.zero,
+                children: [
+                  if (_user != null)
+                    UserAccountsDrawerHeader(
+                      accountName: Text(_user?.displayName ?? 'Signed-in user'),
+                      accountEmail: Text(_user?.email ?? ''),
+                      currentAccountPicture: CircleAvatar(
+                        child: Text(_initialsFromName(_user?.displayName, _user?.email)),
+                      ),
+                    )
+                  else
+                    const DrawerHeader(child: Text('Not signed in')),
 
-                // Read-only forward email display
-                ListTile(
-                  leading: const Icon(Icons.alternate_email_outlined),
-                  title: const Text('Forwarding to'),
-                  subtitle: Text(_forwardEmail.isEmpty ? 'Not set' : _forwardEmail),
-                  enabled: false,
-                ),
-
-                ListTile(
-                  leading: const Icon(Icons.sms_outlined),
-                  title: const Text('Simulate message'),
-                  onTap: () async {
-                    Navigator.pop(context);
-                    await _showSimulateMessageDialog();
-                  },
-                ),
-
-                const Divider(),
-
-                if (_user != null)
+                  // Read-only forward email display
                   ListTile(
-                    leading: const Icon(Icons.logout),
-                    title: const Text('Sign out'),
+                    leading: const Icon(Icons.alternate_email_outlined),
+                    title: const Text('Forwarding to'),
+                    subtitle: Text(_forwardEmail.isEmpty ? 'Not set' : _forwardEmail),
+                    enabled: false,
+                  ),
+
+                  ListTile(
+                    leading: const Icon(Icons.sms_outlined),
+                    title: const Text('Simulate message'),
                     onTap: () async {
                       Navigator.pop(context);
-                      await _signOut();
-                    },
-                  )
-                else
-                  ListTile(
-                    leading: const Icon(Icons.login),
-                    title: const Text('Sign in'),
-                    onTap: () {
-                      Navigator.pop(context);
-                      _handleSignIn();
+                      await _showSimulateMessageDialog();
                     },
                   ),
-              ],
+
+                  const Divider(),
+
+                  if (_user != null)
+                    ListTile(
+                      leading: const Icon(Icons.logout),
+                      title: const Text('Sign out'),
+                      onTap: () async {
+                        Navigator.pop(context);
+                        await _signOut();
+                      },
+                    )
+                  else
+                    ListTile(
+                      leading: const Icon(Icons.login),
+                      title: const Text('Sign in'),
+                      onTap: () {
+                        Navigator.pop(context);
+                        _handleSignIn();
+                      },
+                    ),
+                ],
+              ),
             ),
           ),
-        ),
-        body: _user == null
-            ? LoginPage(
-                initialEmail: _forwardEmail,
-                onEmailChanged: (email) async {
-                  setState(() => _forwardEmail = email);
-                  await _saveForwardEmail(email);
-                },
-                onSignInPressed: _handleSignIn,
-              )
-            : MessagesPage(
-                messages: _messages,
-                initialForwardEmail: _forwardEmail,
-                onForwardEmailChanged: (newEmail) async {
-                  setState(() => _forwardEmail = newEmail);
-                  await _saveForwardEmail(newEmail);
-                },
-                onSimulateMessage: (SmsMessageModel msg) async {
-                  setState(() => _messages.insert(0, msg));
-                  if (_user != null && _forwardEmail.isNotEmpty) {
-                    try {
-                      final gmailService = GmailService(_user!);
-                      await gmailService.sendEmail(
-                        toEmail: _forwardEmail,
-                        subject: 'Simulated SMS from ${msg.address}',
-                        body: msg.body,
-                      );
-                    } catch (e) {
-                      debugPrint('Failed to send email for simulated message: $e');
+          body: _user == null
+              ? LoginPage(
+                  initialEmail: _forwardEmail,
+                  onEmailChanged: (email) async {
+                    setState(() => _forwardEmail = email);
+                    await _saveForwardEmail(email);
+                  },
+                  onSignInPressed: _handleSignIn,
+                )
+              : MessagesPage(
+                  messages: _messages,
+                  initialForwardEmail: _forwardEmail,
+                  onForwardEmailChanged: (newEmail) async {
+                    setState(() => _forwardEmail = newEmail);
+                    await _saveForwardEmail(newEmail);
+                  },
+                  onSimulateMessage: (SmsMessageModel msg) async {
+                    setState(() => _messages.insert(0, msg));
+                    if (_user != null && _forwardEmail.isNotEmpty) {
+                      try {
+                        final gmailService = GmailService(_user!);
+                        await gmailService.sendEmail(
+                          toEmail: _forwardEmail,
+                          subject: 'Simulated SMS from ${msg.address}',
+                          body: msg.body,
+                        );
+                      } catch (e) {
+                        debugPrint('Failed to send email for simulated message: $e');
+                      }
                     }
-                  }
-                },
-              ),
+                  },
+                ),
+        ),
       ),
     );
   }
